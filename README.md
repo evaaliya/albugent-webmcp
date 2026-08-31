@@ -1,0 +1,2 @@
+# albugent-webmcp
+Albugent WebMCP is a new browser-native implementation of the Albugent data-governance concept, rebuilt for the WebMCP Challenge. The previous Albugent_v2.0 repository contains the original backend prototype; this repository contains the new WebMCP implementation.
