@@ -45,6 +45,21 @@ async function initSqlite() {
   }
 }
 
+// FIX: race condition — main.tsx's INIT call and App.tsx's independent
+// SCAN_DATASETS call on mount can both hit the worker before WASM has
+// finished loading (more likely in production, where WASM fetch over
+// the network is slower than on localhost). Whichever message arrives
+// first now "owns" the one shared init promise; every other message
+// type awaits the SAME promise before touching sqlite3, regardless of
+// arrival order.
+let initPromise: Promise<void> | null = null;
+function ensureInitialized(): Promise<void> {
+  if (!initPromise) {
+    initPromise = initSqlite();
+  }
+  return initPromise;
+}
+
 function isValidSqliteHeader(buffer: ArrayBuffer): boolean {
   const header = new Uint8Array(buffer.slice(0, 16));
   const magic = 'SQLite format 3\0';
@@ -138,8 +153,11 @@ self.onmessage = async (event: MessageEvent) => {
   const { id, type, payload } = event.data;
 
   try {
+    // FIX: every message type — not just INIT — waits on the same
+    // init promise first. This makes message arrival order irrelevant.
+    await ensureInitialized();
+
     if (type === 'INIT') {
-      await initSqlite();
       const discoveredDatasets = await scanEnterpriseDatasets();
       self.postMessage({ id, success: true, data: { initialized: true, datasets: discoveredDatasets } });
       return;
@@ -213,13 +231,6 @@ self.onmessage = async (event: MessageEvent) => {
       return;
     }
 
-    // ------------------------------------------------------------
-    // GET_GOVERNANCE_SUMMARY — aggregate across ALL registered datasets.
-    // perDataset now also carries hasPII / piiMaxSeverity / hasHighNull
-    // as independent boolean facts, separate from the blended riskScore —
-    // so the UI can flag PII presence even when it barely moves the
-    // aggregate score.
-    // ------------------------------------------------------------
     if (type === 'GET_GOVERNANCE_SUMMARY') {
       const datasets = Array.from(datasetRegistry.values());
       let totalPiiFields = 0;
