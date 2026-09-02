@@ -1,14 +1,5 @@
 // src/engine/profilers/riskEvaluator.ts
 
-// ============================================================
-// PURPOSE
-// ============================================================
-// Single shared risk-scoring formula. Used by both the assess_risk
-// WebMCP tool (single dataset, on demand) and the worker's aggregate
-// GET_GOVERNANCE_SUMMARY (all datasets, for the dashboard KPIs) — so
-// the two never drift into different scoring logic.
-// ============================================================
-
 import type { PIIField } from './piiDetector';
 
 export interface RiskAssessment {
@@ -28,11 +19,19 @@ export function computeRiskScore(
 
   if (piiFields.some((p) => p.severity === 'HIGH')) {
     riskScore += 45;
-    riskFactors.push('Unmasked HIGH-severity PII detected (SSN/National ID)');
+    riskFactors.push('Unmasked HIGH-severity PII detected (SSN/National ID/Financial account)');
   }
   if (piiFields.some((p) => p.severity === 'MEDIUM')) {
     riskScore += 25;
-    riskFactors.push('Unmasked MEDIUM-severity PII detected (Email/Contact Info)');
+    riskFactors.push('Unmasked MEDIUM-severity PII detected (Name/Contact/Medical attributes)');
+  }
+  // NEW: LOW-severity PII now contributes a small amount instead of
+  // being invisible to the score — previously any dataset with only
+  // LOW findings (e.g. a single financial field) scored 0 and showed
+  // as "Healthy" regardless of how much PII was actually present.
+  if (piiFields.some((p) => p.severity === 'LOW')) {
+    riskScore += 10;
+    riskFactors.push('LOW-severity PII detected (Financial/Other identifiers)');
   }
 
   const highNullCols = columns.filter((c) => c.nullPercentage > NULL_DENSITY_THRESHOLD);

@@ -4,19 +4,16 @@
 // PURPOSE
 // ============================================================
 // Single source of truth for "which anomaly type nudges the agent
-// toward which WebMCP tool(s)". The agent always keeps free choice
-// (tool_choice='auto') — but the pre-filled question text names the
-// relevant tool(s) explicitly, so in practice it reliably picks the
-// right one. Some entries deliberately have an empty tool list: when
-// the fact is already fully known/computed on the client (PII tags,
-// naming-convention lineage), forcing a tool call adds latency and
-// hallucination risk for zero benefit — the question just states the
-// known facts directly.
+// toward which WebMCP tool(s)". Empty relevantTools = the fact is
+// already fully computed on the client — the question states the
+// known facts directly instead of calling a tool.
 //
-// Today there are only 2 real detector tools (profile_dataset,
-// assess_risk). As more deterministic detectors are added, just add
-// an entry here — no changes needed elsewhere. See README.md section
-// "Agent Tool Routing".
+// IMPORTANT: every buildQuestion that references "these columns" or
+// similar must actually LIST the columns in the question text. Saying
+// "these columns were flagged" without naming them leaves the model
+// free to guess — which it will, and it will guess wrong (this was a
+// real bug: the agent once claimed all 15 columns were PII when only
+// 1 had actually been flagged).
 // ============================================================
 
 export type AnomalyType = 'NULL_DENSITY' | 'PII_EXPOSURE' | 'RISK_SCORE' | 'LINEAGE_CONTEXT';
@@ -24,8 +21,6 @@ export type AnomalyType = 'NULL_DENSITY' | 'PII_EXPOSURE' | 'RISK_SCORE' | 'LINE
 export interface AnomalyToolBinding {
   label: string;
   relevantTools: string[];
-  // context carries extra known facts (e.g. lineage neighbors) that get
-  // embedded directly into the question text — no tool call needed for those.
   buildQuestion: (urn: string, context?: Record<string, any>) => string;
 }
 
@@ -39,11 +34,14 @@ export const ANOMALY_TOOL_MAP: Record<AnomalyType, AnomalyToolBinding> = {
 
   PII_EXPOSURE: {
     label: 'PII exposure',
-    // Deliberately empty — PII columns are already shown on screen via
-    // deterministic pattern matching (piiDetector.ts). No tool call needed.
     relevantTools: [],
-    buildQuestion: (urn) =>
-      `These columns in ${urn} were flagged as PII. Should any of them be masked, and why?`
+    buildQuestion: (urn, context) => {
+      const fields = context?.piiFields as { columnName: string; piiType: string; severity: string }[] | undefined;
+      const list = fields && fields.length > 0
+        ? fields.map((f) => `${f.columnName} (${f.piiType}, ${f.severity} severity)`).join(', ')
+        : 'none';
+      return `In ${urn}, exactly these columns were deterministically flagged as PII: ${list}. Only discuss the columns listed here — do not assume any other column is PII. Should any of them be masked, and why?`;
+    }
   },
 
   RISK_SCORE: {
@@ -55,9 +53,6 @@ export const ANOMALY_TOOL_MAP: Record<AnomalyType, AnomalyToolBinding> = {
 
   LINEAGE_CONTEXT: {
     label: 'Lineage relationships',
-    // Deliberately empty — the upstream/downstream neighbors are computed
-    // deterministically client-side (see lineageHeuristics.ts) from naming
-    // conventions, and handed to the agent directly in the question text.
     relevantTools: [],
     buildQuestion: (urn, context) => {
       const upstream = context?.upstream?.length ? context.upstream.join(', ') : 'none detected';

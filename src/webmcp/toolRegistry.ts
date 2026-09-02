@@ -6,27 +6,15 @@
 import { detectPII, type PIIField } from '../engine/profilers/piiDetector';
 import { computeRiskScore } from '../engine/profilers/riskEvaluator';
 import { inferLineageNeighbors } from '../engine/profilers/lineageHeuristics';
+import { addProposal, getProposal, removeProposal, type RemediationProposal } from './proposalStore';
 
-// ============================================================
-// SECTION: Types
-// ============================================================
-export interface RemediationProposal {
-  proposalId: string;
-  datasetUrn: string;
-  actionType: 'MASK_PII' | 'REMEDIATE_NULLS' | 'CIRCUIT_BREAK';
-  description: string;
-  sqlSnippet: string;
-  approved: boolean;
-}
-
-export const pendingProposalsMap = new Map<string, RemediationProposal>();
+export type { RemediationProposal };
 
 // ============================================================
 // SECTION: Tool registration
 // ============================================================
 export function registerGovernanceTools(
-  callWorker: (type: string, payload?: any) => Promise<any>,
-  onProposalCreated?: (proposal: RemediationProposal) => void
+  callWorker: (type: string, payload?: any) => Promise<any>
 ) {
   const modelContext = (document as any).modelContext;
   if (!modelContext) return;
@@ -94,8 +82,6 @@ export function registerGovernanceTools(
 
   // ------------------------------------------------------------
   // TOOL 4: assess_risk
-  // Uses the shared computeRiskScore helper — same formula as the
-  // dashboard's aggregate GET_GOVERNANCE_SUMMARY, so numbers never drift.
   // ------------------------------------------------------------
   modelContext.registerTool({
     name: 'assess_risk',
@@ -133,9 +119,6 @@ export function registerGovernanceTools(
 
   // ------------------------------------------------------------
   // TOOL 5: inspect_lineage
-  // Re-enabled: runs entirely client-side via naming-convention
-  // heuristics (see lineageHeuristics.ts) — no worker message type
-  // needed, so it can never hang like the old GET_LINEAGE_IMPACT did.
   // ------------------------------------------------------------
   modelContext.registerTool({
     name: 'inspect_lineage',
@@ -180,53 +163,115 @@ export function registerGovernanceTools(
 
   // ------------------------------------------------------------
   // TOOL 6: propose_remediation
+  // Now reasons about whether masking is actually warranted, instead
+  // of blindly creating a proposal whenever any PII column exists.
+  // If the dataset's overall risk is SAFE, it returns an advisory
+  // instead of a proposal, so the agent can genuinely push back
+  // ("this table looks healthy, are you sure?") rather than silently
+  // complying — and rather than inventing a fake explanation later.
   // ------------------------------------------------------------
   modelContext.registerTool({
     name: 'propose_remediation',
-    description: 'Proposes a remediation action for human approval.',
+    description: 'Proposes a remediation action for human approval. Checks overall risk first — if the dataset is SAFE, it will explain why masking may not be warranted instead of creating a proposal, unless force is set to true.',
     inputSchema: {
       type: 'object',
       properties: {
         datasetUrn: { type: 'string' },
-        actionType: { type: 'string', enum: ['MASK_PII', 'REMEDIATE_NULLS', 'CIRCUIT_BREAK'] }
+        actionType: { type: 'string', enum: ['MASK_PII', 'REMEDIATE_NULLS', 'CIRCUIT_BREAK'] },
+        force: { type: 'boolean', description: 'Set true only if the human has explicitly confirmed they want to proceed despite a low risk score.' }
       },
       required: ['datasetUrn', 'actionType']
     },
-    execute: async (args: { datasetUrn: string; actionType: 'MASK_PII' | 'REMEDIATE_NULLS' | 'CIRCUIT_BREAK' }) => {
+    execute: async (args: { datasetUrn: string; actionType: 'MASK_PII' | 'REMEDIATE_NULLS' | 'CIRCUIT_BREAK'; force?: boolean }) => {
       const match = args.datasetUrn.match(/,[^,]+\.([^,]+),PROD\)/);
       const tableName = match ? match[1] : args.datasetUrn;
 
-      const proposalId = `prop_${Math.random().toString(36).substring(2, 8)}`;
-      let sqlSnippet = '';
-      let description = '';
-
       if (args.actionType === 'MASK_PII') {
-        sqlSnippet = `UPDATE "${tableName}" SET email = '***@masked.com' WHERE email IS NOT NULL;`;
-        description = `Apply MASK_PII transformation on table ${tableName}`;
-      } else {
-        sqlSnippet = `-- Action ${args.actionType} execution logic`;
-        description = `Execute ${args.actionType} on table ${tableName}`;
+        try {
+          const profile = await callWorker('GET_PROFILE_METRICS', { urn: args.datasetUrn });
+          const columnNames = profile.columns.map((c: any) => c.columnName);
+          const piiFields: PIIField[] = detectPII(columnNames);
+
+          if (piiFields.length === 0) {
+            return {
+              content: [{ type: 'text', text: `No PII columns were detected for ${args.datasetUrn}. Nothing to mask — no proposal was created.` }],
+              isError: true
+            };
+          }
+
+          const { riskScore, riskLevel } = computeRiskScore(piiFields, profile.columns);
+
+          // Real check, not a fabricated one: SAFE risk level genuinely
+          // means low priority. Push back instead of complying blindly.
+          if (riskLevel === 'SAFE' && !args.force) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: 'ADVISORY_NOT_PROPOSED',
+                  datasetUrn: args.datasetUrn,
+                  riskScore,
+                  riskLevel,
+                  piiFieldsFound: piiFields.map((f) => f.columnName),
+                  message: `This dataset's overall risk score is ${riskScore}/100 (SAFE). The PII columns found (${piiFields.map((f) => f.columnName).join(', ')}) are present but not currently contributing to elevated risk. Masking is not clearly justified here. Ask the human if they still want to proceed — if so, call this tool again with force=true.`
+                }, null, 2)
+              }]
+            };
+          }
+
+          const setClauses = piiFields.map((f) => `"${f.columnName}" = '***MASKED***'`).join(', ');
+          const sqlSnippet = `UPDATE "${tableName}" SET ${setClauses};`;
+          const description = `Mask ${piiFields.length} PII column(s) in ${tableName}: ${piiFields.map((f) => f.columnName).join(', ')}`;
+
+          const proposalId = `prop_${Math.random().toString(36).substring(2, 8)}`;
+          const proposal: RemediationProposal = {
+            proposalId,
+            datasetUrn: args.datasetUrn,
+            actionType: args.actionType,
+            description,
+            sqlSnippet,
+            approved: false
+          };
+
+          addProposal(proposal);
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                proposalId,
+                status: 'PENDING_HUMAN_APPROVAL',
+                riskScore,
+                riskLevel,
+                description,
+                sqlSnippet,
+                message: 'Remediation proposal generated. A human operator must approve this in the chat before it is applied.'
+              }, null, 2)
+            }]
+          };
+        } catch (err: any) {
+          return { content: [{ type: 'text', text: `Failed to evaluate dataset risk: ${err.message}` }], isError: true };
+        }
       }
 
+      // Non-MASK_PII actions unchanged — not yet fully implemented.
+      const proposalId = `prop_${Math.random().toString(36).substring(2, 8)}`;
       const proposal: RemediationProposal = {
         proposalId,
         datasetUrn: args.datasetUrn,
         actionType: args.actionType,
-        description,
-        sqlSnippet,
+        description: `Execute ${args.actionType} on table ${tableName}`,
+        sqlSnippet: `-- Action ${args.actionType} execution logic (not yet implemented)`,
         approved: false
       };
-
-      pendingProposalsMap.set(proposalId, proposal);
-      if (onProposalCreated) onProposalCreated(proposal);
-
+      addProposal(proposal);
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
             proposalId,
             status: 'PENDING_HUMAN_APPROVAL',
-            message: 'Remediation proposal generated. A human operator must approve this action in the UI before calling apply_remediation.'
+            message: 'Remediation proposal generated. A human operator must approve this in the chat before it is applied.'
           }, null, 2)
         }]
       };
@@ -245,7 +290,7 @@ export function registerGovernanceTools(
       required: ['proposalId']
     },
     execute: async (args: { proposalId: string }) => {
-      const proposal = pendingProposalsMap.get(args.proposalId);
+      const proposal = getProposal(args.proposalId);
 
       if (!proposal) {
         return { content: [{ type: 'text', text: `ERROR: Proposal ${args.proposalId} not found.` }], isError: true };
@@ -255,17 +300,12 @@ export function registerGovernanceTools(
       }
 
       try {
-        await callWorker('APPLY_REMEDIATION', { sql: proposal.sqlSnippet });
-        pendingProposalsMap.delete(args.proposalId);
+        await callWorker('APPLY_REMEDIATION', { urn: proposal.datasetUrn, sql: proposal.sqlSnippet });
+        removeProposal(args.proposalId);
         return { content: [{ type: 'text', text: `SUCCESS: Remediation ${args.proposalId} applied successfully.` }] };
       } catch (err: any) {
         return { content: [{ type: 'text', text: `SQL Execution Failed: ${err.message}` }], isError: true };
       }
     }
   });
-
-  // ------------------------------------------------------------
-  // select_database intentionally omitted — redundant, since all 3
-  // domains are already eager-loaded at INIT.
-  // ------------------------------------------------------------
 }

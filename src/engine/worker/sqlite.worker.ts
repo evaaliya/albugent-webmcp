@@ -27,11 +27,10 @@ const dbConnections: Map<string, any> = new Map();
 const datasetRegistry: Map<string, DatasetMeta> = new Map();
 const TARGET_DOMAINS = ['healthcare', 'fiction-retail', 'nyc-taxi'];
 
-// Явное соответствие домена реальному имени файла в public/datasets/
 const DOMAIN_FILE_MAP: Record<string, string> = {
   'healthcare': 'healthcare.db',
   'fiction-retail': 'fiction-retail.db',
-  'nyc-taxi': 'nyc_taxi_pipeline.db', // реальное имя файла отличается от имени домена
+  'nyc-taxi': 'nyc_taxi_pipeline.db',
 };
 
 // ============================================================
@@ -139,9 +138,6 @@ self.onmessage = async (event: MessageEvent) => {
   const { id, type, payload } = event.data;
 
   try {
-    // ------------------------------------------------------------
-    // INIT — bootstrap SQLite WASM and do the first scan
-    // ------------------------------------------------------------
     if (type === 'INIT') {
       await initSqlite();
       const discoveredDatasets = await scanEnterpriseDatasets();
@@ -149,18 +145,12 @@ self.onmessage = async (event: MessageEvent) => {
       return;
     }
 
-    // ------------------------------------------------------------
-    // SCAN_DATASETS — re-scan (cheap: DBs already loaded in memory)
-    // ------------------------------------------------------------
     if (type === 'SCAN_DATASETS') {
       const datasets = await scanEnterpriseDatasets();
       self.postMessage({ id, success: true, data: datasets });
       return;
     }
 
-    // ------------------------------------------------------------
-    // GET_SCHEMA — column list for one dataset
-    // ------------------------------------------------------------
     if (type === 'GET_SCHEMA') {
       const { urn } = payload;
       const meta = datasetRegistry.get(urn);
@@ -178,9 +168,6 @@ self.onmessage = async (event: MessageEvent) => {
       return;
     }
 
-    // ------------------------------------------------------------
-    // GET_PROFILE_METRICS — anomaly profile for one dataset
-    // ------------------------------------------------------------
     if (type === 'GET_PROFILE_METRICS') {
       const { urn } = payload;
       const meta = datasetRegistry.get(urn);
@@ -207,9 +194,6 @@ self.onmessage = async (event: MessageEvent) => {
       return;
     }
 
-    // ------------------------------------------------------------
-    // GET_PII_COLUMNS — PII column tags for one dataset
-    // ------------------------------------------------------------
     if (type === 'GET_PII_COLUMNS') {
       const { urn } = payload;
       const meta = datasetRegistry.get(urn);
@@ -231,15 +215,27 @@ self.onmessage = async (event: MessageEvent) => {
 
     // ------------------------------------------------------------
     // GET_GOVERNANCE_SUMMARY — aggregate across ALL registered datasets.
-    // Powers the dashboard's top KPI banner and "Recent Anomalies" list.
-    // Runs entirely inside the worker in one round-trip, instead of the
-    // UI making 34 separate GET_PROFILE_METRICS calls.
+    // perDataset now also carries hasPII / piiMaxSeverity / hasHighNull
+    // as independent boolean facts, separate from the blended riskScore —
+    // so the UI can flag PII presence even when it barely moves the
+    // aggregate score.
     // ------------------------------------------------------------
     if (type === 'GET_GOVERNANCE_SUMMARY') {
       const datasets = Array.from(datasetRegistry.values());
       let totalPiiFields = 0;
       let totalRiskScore = 0;
       let datasetsScored = 0;
+
+      const piiSeverityBreakdown = { HIGH: 0, MEDIUM: 0, LOW: 0 };
+      const riskLevelBreakdown = { CRITICAL: 0, WARNING: 0, SAFE: 0 };
+      const perDataset: Array<{
+        urn: string;
+        riskLevel: 'CRITICAL' | 'WARNING' | 'SAFE';
+        riskScore: number;
+        hasPII: boolean;
+        piiMaxSeverity: 'HIGH' | 'MEDIUM' | 'LOW' | null;
+        hasHighNull: boolean;
+      }> = [];
 
       const anomalies: Array<{
         urn: string;
@@ -273,10 +269,22 @@ self.onmessage = async (event: MessageEvent) => {
           const piiFields = detectPII(cols.map((c) => c.name));
 
           totalPiiFields += piiFields.length;
+          piiFields.forEach((p) => { piiSeverityBreakdown[p.severity]++; });
 
           const { riskScore, riskLevel } = computeRiskScore(piiFields, profile.columns);
           totalRiskScore += riskScore;
           datasetsScored++;
+          riskLevelBreakdown[riskLevel]++;
+
+          const hasPII = piiFields.length > 0;
+          const piiMaxSeverity: 'HIGH' | 'MEDIUM' | 'LOW' | null = hasPII
+            ? (piiFields.some((f) => f.severity === 'HIGH') ? 'HIGH'
+              : piiFields.some((f) => f.severity === 'MEDIUM') ? 'MEDIUM'
+              : 'LOW')
+            : null;
+          const hasHighNull = profile.columns.some((c) => c.nullPercentage > 20);
+
+          perDataset.push({ urn: meta.urn, riskLevel, riskScore, hasPII, piiMaxSeverity, hasHighNull });
 
           if (riskLevel !== 'SAFE') {
             const highNull = profile.columns.filter((c) => c.nullPercentage > 20);
@@ -302,7 +310,6 @@ self.onmessage = async (event: MessageEvent) => {
         }
       }
 
-      // CRITICAL anomalies first, most severe first.
       anomalies.sort((a, b) => (a.severity === 'CRITICAL' ? 0 : 1) - (b.severity === 'CRITICAL' ? 0 : 1));
 
       const avgRiskScore01 = datasetsScored > 0 ? totalRiskScore / datasetsScored / 100 : 0;
@@ -314,9 +321,26 @@ self.onmessage = async (event: MessageEvent) => {
           datasetsScored,
           totalPiiFields,
           avgRiskScore: Number(avgRiskScore01.toFixed(3)),
-          anomalies: anomalies.slice(0, 10)
+          anomalies: anomalies.slice(0, 10),
+          piiSeverityBreakdown,
+          riskLevelBreakdown,
+          perDataset
         }
       });
+      return;
+    }
+
+    if (type === 'APPLY_REMEDIATION') {
+      const { urn, sql } = payload;
+      const meta = datasetRegistry.get(urn);
+      if (!meta) throw new Error(`URN ${urn} not found in registry`);
+
+      const db = dbConnections.get(meta.domain);
+      if (!db) throw new Error(`No open database connection for domain ${meta.domain}`);
+
+      db.exec({ sql });
+
+      self.postMessage({ id, success: true, data: { applied: true, sql } });
       return;
     }
 

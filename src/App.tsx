@@ -3,12 +3,15 @@
 // ============================================================
 // SECTION: Imports
 // ============================================================
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { callWorker } from './engine/workerClient';
 import { detectPII } from './engine/profilers/piiDetector';
 import { ANOMALY_TOOL_MAP } from './webmcp/anomalyToolMap';
 import { inferLineageNeighbors } from './engine/profilers/lineageHeuristics';
 import ChatWidget from './components/ChatWidget';
+import KPIModal, { type KPIModalKind } from './components/KPIModal';
+import AnomalyIcons from './components/AnomalyIcons';
+import { subscribeToProposals, markApproved, removeProposal, type RemediationProposal } from './webmcp/proposalStore';
 
 // ============================================================
 // SECTION: Types
@@ -18,6 +21,9 @@ interface DatasetItem {
   domain: string;
   table_name: string;
   status: 'Healthy' | 'Warning' | 'Critical';
+  hasPII: boolean;
+  piiMaxSeverity: 'HIGH' | 'MEDIUM' | 'LOW' | null;
+  hasHighNull: boolean;
 }
 
 interface ColumnProfile {
@@ -46,16 +52,27 @@ interface GovernanceAnomaly {
   timestamp: string;
 }
 
+interface PerDatasetRisk {
+  urn: string;
+  riskLevel: 'CRITICAL' | 'WARNING' | 'SAFE';
+  riskScore: number;
+  hasPII: boolean;
+  piiMaxSeverity: 'HIGH' | 'MEDIUM' | 'LOW' | null;
+  hasHighNull: boolean;
+}
+
 interface GovernanceSummary {
   datasetsScored: number;
   totalPiiFields: number;
-  avgRiskScore: number; // 0-1 range
+  avgRiskScore: number;
   anomalies: GovernanceAnomaly[];
+  piiSeverityBreakdown: { HIGH: number; MEDIUM: number; LOW: number };
+  riskLevelBreakdown: { CRITICAL: number; WARNING: number; SAFE: number };
+  perDataset: PerDatasetRisk[];
 }
 
 const NULL_DENSITY_THRESHOLD = 20;
 
-// Formats a 0-1 risk score as ".268" style (matches the original mock design).
 function formatRiskScore(score01: number): string {
   const s = score01.toFixed(3);
   return s.startsWith('0.') ? s.slice(1) : s;
@@ -64,6 +81,12 @@ function formatRiskScore(score01: number): string {
 function formatTime(isoString: string): string {
   const d = new Date(isoString);
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function riskLevelToStatus(level: 'CRITICAL' | 'WARNING' | 'SAFE'): DatasetItem['status'] {
+  if (level === 'CRITICAL') return 'Critical';
+  if (level === 'WARNING') return 'Warning';
+  return 'Healthy';
 }
 
 export default function App() {
@@ -78,9 +101,13 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
 
-  // Real, computed dashboard KPIs — replaces the old hardcoded "189 Fields" / ".268".
   const [governanceSummary, setGovernanceSummary] = useState<GovernanceSummary | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(true);
+
+  const [activeModal, setActiveModal] = useState<KPIModalKind | null>(null);
+
+  const [proposals, setProposals] = useState<RemediationProposal[]>([]);
+  const [applyingId, setApplyingId] = useState<string | null>(null);
 
   const [chatPresetQuery, setChatPresetQuery] = useState('');
   const [chatPresetTrigger, setChatPresetTrigger] = useState(0);
@@ -88,37 +115,66 @@ export default function App() {
   const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || '';
 
   // ============================================================
-  // SECTION: Data loading — scan datasets, then aggregate summary
+  // SECTION: Data loading
   // ============================================================
-  useEffect(() => {
-    async function initData() {
-      try {
-        const result = await callWorker('SCAN_DATASETS');
-        if (Array.isArray(result)) {
-          const mapped: DatasetItem[] = result.map((d: any) => ({
-            urn: d.urn,
-            domain: d.domain,
-            table_name: d.table,
-            status: d.domain === 'healthcare' ? 'Critical' : 'Healthy'
-          }));
-          setDatasets(mapped);
-        }
-      } catch (err) {
-        console.error('Error scanning datasets via SQLite worker:', err);
+  const refreshGovernanceData = useCallback(async () => {
+    try {
+      const result = await callWorker('SCAN_DATASETS');
+      let mapped: DatasetItem[] = [];
+      if (Array.isArray(result)) {
+        mapped = result.map((d: any) => ({
+          urn: d.urn,
+          domain: d.domain,
+          table_name: d.table,
+          status: 'Healthy',
+          hasPII: false,
+          piiMaxSeverity: null,
+          hasHighNull: false
+        }));
       }
 
-      // Runs after the scan above, so the worker's dataset registry is populated.
-      try {
-        setSummaryLoading(true);
-        const summary = await callWorker('GET_GOVERNANCE_SUMMARY');
-        setGovernanceSummary(summary);
-      } catch (err) {
-        console.error('Error loading governance summary:', err);
-      } finally {
-        setSummaryLoading(false);
+      setSummaryLoading(true);
+      const summary: GovernanceSummary = await callWorker('GET_GOVERNANCE_SUMMARY');
+      setGovernanceSummary(summary);
+
+      const riskMap = new Map(summary.perDataset.map((d) => [d.urn, d]));
+      setDatasets(
+        mapped.map((d) => {
+          const info = riskMap.get(d.urn);
+          if (!info) return d;
+          return {
+            ...d,
+            status: riskLevelToStatus(info.riskLevel),
+            hasPII: info.hasPII,
+            piiMaxSeverity: info.piiMaxSeverity,
+            hasHighNull: info.hasHighNull
+          };
+        })
+      );
+
+      if (selectedUrn) {
+        try {
+          const profile = await callWorker('GET_PROFILE_METRICS', { urn: selectedUrn });
+          setDetailProfile(profile);
+        } catch {
+          // non-fatal
+        }
       }
+    } catch (err) {
+      console.error('Error refreshing governance data:', err);
+    } finally {
+      setSummaryLoading(false);
     }
-    initData();
+  }, [selectedUrn]);
+
+  useEffect(() => {
+    const unsubscribe = subscribeToProposals(setProposals);
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    refreshGovernanceData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ============================================================
@@ -168,8 +224,30 @@ export default function App() {
     setActiveTab('detail');
   };
 
+  const handleApproveProposal = async (proposalId: string) => {
+    const proposal = proposals.find((p) => p.proposalId === proposalId);
+    if (!proposal) return;
+
+    setApplyingId(proposalId);
+    markApproved(proposalId);
+
+    try {
+      await callWorker('APPLY_REMEDIATION', { urn: proposal.datasetUrn, sql: proposal.sqlSnippet });
+      removeProposal(proposalId);
+      await refreshGovernanceData();
+    } catch (err: any) {
+      alert(`Failed to apply proposal: ${err.message}`);
+    } finally {
+      setApplyingId(null);
+    }
+  };
+
+  const handleRejectProposal = (proposalId: string) => {
+    removeProposal(proposalId);
+  };
+
   // ============================================================
-  // SECTION: Derived data for the detail tab
+  // SECTION: Derived data
   // ============================================================
   const piiFields = detailProfile
     ? detectPII(detailProfile.columns.map((c) => c.columnName))
@@ -187,15 +265,18 @@ export default function App() {
     ? inferLineageNeighbors(detailProfile.tableName, siblingTableNames)
     : null;
 
+  const datasetStatusCounts = {
+    Healthy: datasets.filter((d) => d.status === 'Healthy').length,
+    Warning: datasets.filter((d) => d.status === 'Warning').length,
+    Critical: datasets.filter((d) => d.status === 'Critical').length
+  };
+
   // ============================================================
   // SECTION: Render
   // ============================================================
   return (
     <div className="h-screen bg-[#060608] text-mono text-gray-200 font-mono flex flex-col overflow-hidden">
 
-      {/* ---------------------------------------------------- */}
-      {/* BLOCK: Header navbar                                  */}
-      {/* ---------------------------------------------------- */}
       <header className="border-b border-gray-800 px-6 py-3 flex items-center justify-between shrink-0">
         <div className="flex items-center space-x-3">
           <div className="text-white font-bold tracking-widest flex items-center gap-2">
@@ -217,7 +298,7 @@ export default function App() {
             onClick={() => setActiveTab('detail')}
             className={`hover:text-white transition-colors ${activeTab === 'detail' ? 'text-white border-b-2 border-white pb-1' : 'text-gray-500'}`}
           >
-            Lineage
+            Dataset Detail
           </button>
         </nav>
 
@@ -226,50 +307,50 @@ export default function App() {
         </div>
       </header>
 
-      {/* ---------------------------------------------------- */}
-      {/* BLOCK: Main content area (tab-switched)                */}
-      {/* ---------------------------------------------------- */}
       <main className="flex-1 p-6 flex flex-col gap-6 overflow-hidden">
 
-        {/* ====================================================== */}
-        {/* TAB 1: Main dashboard                                   */}
-        {/* ====================================================== */}
         {activeTab === 'datasets' && (
           <>
-            {/* BLOCK: Top KPI banner — now backed by real GET_GOVERNANCE_SUMMARY data */}
             <div className="relative h-48 bg-black border border-gray-800 rounded-lg overflow-hidden flex items-center justify-around p-4 shrink-0">
               <div className="absolute inset-0 bg-[radial-gradient(#1f2937_1px,transparent_1px)] [background-size:16px_16px] opacity-40"></div>
 
-              <div className="z-10 bg-black/80 border border-gray-800 p-4 rounded text-center min-w-[160px]">
+              <button
+                onClick={() => setActiveModal('datasets')}
+                className="z-10 bg-black/80 border border-gray-800 hover:border-gray-600 p-4 rounded text-center min-w-[160px] cursor-pointer transition-colors"
+              >
                 <div className="text-xs text-gray-400 flex items-center justify-center gap-2">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> DATASETS MONITORED
                 </div>
                 <div className="text-2xl font-bold mt-1">{datasets.length}</div>
-              </div>
+              </button>
 
-              <div className="z-10 bg-black/80 border border-gray-800 p-4 rounded text-center min-w-[160px]">
+              <button
+                onClick={() => setActiveModal('pii')}
+                className="z-10 bg-black/80 border border-gray-800 hover:border-gray-600 p-4 rounded text-center min-w-[160px] cursor-pointer transition-colors"
+              >
                 <div className="text-xs text-gray-400 flex items-center justify-center gap-2">
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span> PII DETECTED
                 </div>
                 <div className="text-2xl font-bold mt-1 text-amber-400">
                   {summaryLoading ? '...' : `${governanceSummary?.totalPiiFields ?? 0} Fields`}
                 </div>
-              </div>
+              </button>
 
-              <div className="z-10 bg-black/80 border border-gray-800 p-4 rounded text-center min-w-[160px]">
+              <button
+                onClick={() => setActiveModal('risk')}
+                className="z-10 bg-black/80 border border-gray-800 hover:border-gray-600 p-4 rounded text-center min-w-[160px] cursor-pointer transition-colors"
+              >
                 <div className="text-xs text-gray-400 flex items-center justify-center gap-2">
                   <span className="w-1.5 h-1.5 rounded-full bg-red-500"></span> RISK SCORE
                 </div>
                 <div className="text-2xl font-bold mt-1 text-red-400">
                   {summaryLoading ? '...' : formatRiskScore(governanceSummary?.avgRiskScore ?? 0)}
                 </div>
-              </div>
+              </button>
             </div>
 
-            {/* BLOCK: Three-column grid */}
             <div className="grid grid-cols-12 gap-6 flex-1 min-h-0">
 
-              {/* ---- COLUMN 1: Active governance runs ---- */}
               <div className="col-span-4 bg-[#0a0a0f] border border-gray-800 rounded-lg p-4 flex flex-col overflow-hidden">
                 <h3 className="text-xs text-gray-400 font-semibold mb-4 tracking-wider uppercase">ACTIVE GOVERNANCE RUNS</h3>
                 <div className="space-y-2 overflow-y-auto flex-1 pr-1">
@@ -282,6 +363,11 @@ export default function App() {
                       <span className="text-sm font-medium text-gray-300 min-w-0 truncate">
                         {d.table_name}
                       </span>
+                      <AnomalyIcons
+                        hasPII={d.hasPII}
+                        piiMaxSeverity={d.piiMaxSeverity}
+                        hasHighNull={d.hasHighNull}
+                      />
                       <span className={`text-xs px-2 py-0.5 rounded shrink-0 ${
                         d.status === 'Healthy' ? 'text-emerald-400 bg-emerald-950/40 border border-emerald-900' :
                         d.status === 'Critical' ? 'text-red-400 bg-red-950/40 border border-red-900' : 'text-amber-400 bg-amber-950/40'
@@ -293,7 +379,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* ---- COLUMN 2: Recent anomalies — now real, from GET_GOVERNANCE_SUMMARY ---- */}
               <div className="col-span-4 bg-[#0a0a0f] border border-gray-800 rounded-lg p-4 flex flex-col overflow-hidden">
                 <h3 className="text-xs text-gray-400 font-semibold mb-4 tracking-wider uppercase">RECENT ANOMALIES</h3>
                 <div className="space-y-3 overflow-y-auto flex-1 pr-1">
@@ -327,25 +412,54 @@ export default function App() {
                 </div>
               </div>
 
-              {/* ---- COLUMN 3: Remediation queue (Human-in-the-Loop) ---- */}
               <div className="col-span-4 bg-[#0a0a0f] border border-gray-800 rounded-lg p-4 flex flex-col overflow-hidden">
                 <h3 className="text-xs text-gray-400 font-semibold mb-4 tracking-wider uppercase">REMEDIATION QUEUE (PENDING APPROVAL)</h3>
-                <div className="text-xs text-gray-600 text-center py-8">No pending action proposals</div>
+                {proposals.length === 0 ? (
+                  <div className="text-xs text-gray-600 text-center py-8">
+                    No pending action proposals. Ask the agent to propose a remediation
+                    (e.g. "propose masking PII in ...") to see it appear here.
+                  </div>
+                ) : (
+                  <div className="space-y-3 overflow-y-auto flex-1 pr-1">
+                    {proposals.map((prop) => (
+                      <div key={prop.proposalId} className="p-3 bg-black border border-gray-800 rounded space-y-2">
+                        <div className="text-xs font-bold text-gray-200">{prop.actionType}</div>
+                        <div className="text-[11px] text-gray-500">{prop.description}</div>
+                        <div className="text-[11px] text-gray-400 font-mono bg-gray-900 p-1.5 rounded break-all">
+                          {prop.sqlSnippet}
+                        </div>
+                        <div className="flex space-x-2 pt-1">
+                          <button
+                            onClick={() => handleApproveProposal(prop.proposalId)}
+                            disabled={applyingId === prop.proposalId}
+                            className="flex-1 bg-emerald-950 hover:bg-emerald-900 disabled:opacity-50 border border-emerald-700 text-emerald-300 text-xs py-1 rounded font-bold transition-colors"
+                          >
+                            {applyingId === prop.proposalId ? 'Applying...' : 'APPROVE'}
+                          </button>
+                          <button
+                            onClick={() => handleRejectProposal(prop.proposalId)}
+                            disabled={applyingId === prop.proposalId}
+                            className="flex-1 bg-red-950 hover:bg-red-900 disabled:opacity-50 border border-red-700 text-red-300 text-xs py-1 rounded font-bold transition-colors"
+                          >
+                            REJECT
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </>
         )}
 
-        {/* ====================================================== */}
-        {/* TAB 2: Dataset detail — real per-column profile + lineage */}
-        {/* ====================================================== */}
         {activeTab === 'detail' && (
-          <div className="space-y-6 flex-1 overflow-y-auto">
-            <div className="bg-[#0a0a0f] border border-gray-800 rounded-lg p-6">
-              <h2 className="text-xl font-bold text-white mb-1 break-all">
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
+            <div className="bg-[#0a0a0f] border border-gray-800 rounded-lg p-6 flex-1 min-h-0 flex flex-col overflow-hidden">
+              <h2 className="text-xl font-bold text-white mb-1 break-all shrink-0">
                 {selectedUrn || 'No dataset selected'}
               </h2>
-              <div className="text-xs text-gray-500 mb-6">
+              <div className="text-xs text-gray-500 mb-6 shrink-0">
                 SOURCE: SQLite WASM // {detailProfile ? `${detailProfile.totalRows} rows scanned` : 'loading...'}
               </div>
 
@@ -358,12 +472,11 @@ export default function App() {
               {detailError && <div className="text-sm text-red-400">Failed to load profile: {detailError}</div>}
 
               {detailProfile && !detailLoading && !detailError && (
-                <div className="grid grid-cols-2 gap-8">
+                <div className="grid grid-cols-2 gap-8 flex-1 min-h-0 overflow-hidden">
 
-                  {/* --- LEFT: column summary + PII badges --- */}
-                  <div>
-                    <h4 className="text-xs text-gray-400 uppercase mb-3">Column Profile</h4>
-                    <div className="space-y-3">
+                  <div className="flex flex-col min-h-0 overflow-hidden">
+                    <h4 className="text-xs text-gray-400 uppercase mb-3 shrink-0">Column Profile</h4>
+                    <div className="space-y-3 overflow-y-auto flex-1 pr-2">
                       {detailProfile.columns.map((col) => (
                         <div key={col.columnName}>
                           <div className="flex justify-between text-xs text-gray-300 mb-1">
@@ -382,11 +495,11 @@ export default function App() {
                       ))}
                     </div>
 
-                    <h4 className="text-xs text-gray-400 uppercase mt-6 mb-3">PII Detection Results</h4>
+                    <h4 className="text-xs text-gray-400 uppercase mt-6 mb-3 shrink-0">PII Detection Results</h4>
                     {piiFields.length === 0 ? (
-                      <div className="text-xs text-gray-600">No PII columns detected.</div>
+                      <div className="text-xs text-gray-600 shrink-0">No PII columns detected.</div>
                     ) : (
-                      <div className="flex flex-wrap gap-2">
+                      <div className="flex flex-wrap gap-2 shrink-0 max-h-24 overflow-y-auto">
                         {piiFields.map((p) => (
                           <span
                             key={p.columnName}
@@ -406,8 +519,7 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* --- RIGHT: anomaly action cards + lineage --- */}
-                  <div className="border-l border-gray-800 pl-8 space-y-4">
+                  <div className="border-l border-gray-800 pl-8 space-y-4 overflow-y-auto min-h-0">
                     <h4 className="text-xs text-gray-400 uppercase mb-3">Anomaly Actions</h4>
 
                     {highNullColumns.length > 0 && (
@@ -436,12 +548,24 @@ export default function App() {
                         <div className="text-[11px] text-gray-400">
                           Already shown above — no agent call needed for detection itself.
                         </div>
-                        <button
-                          onClick={() => handleAskAgent(ANOMALY_TOOL_MAP.PII_EXPOSURE.buildQuestion(selectedUrn!))}
-                          className="text-xs bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-200 px-2 py-1 rounded transition-colors"
-                        >
-                          Ask about masking
-                        </button>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleAskAgent(
+                              ANOMALY_TOOL_MAP.PII_EXPOSURE.buildQuestion(selectedUrn!, { piiFields })
+                            )}
+                            className="text-xs bg-gray-900 hover:bg-gray-800 border border-gray-700 text-gray-200 px-2 py-1 rounded transition-colors"
+                          >
+                            Ask about masking
+                          </button>
+                          <button
+                            onClick={() => handleAskAgent(
+                              `Propose a MASK_PII remediation for ${selectedUrn}.`
+                            )}
+                            className="text-xs bg-amber-950 hover:bg-amber-900 border border-amber-700 text-amber-300 px-2 py-1 rounded transition-colors"
+                          >
+                            Propose masking fix
+                          </button>
+                        </div>
                       </div>
                     )}
 
@@ -517,13 +641,22 @@ export default function App() {
         )}
       </main>
 
-      {/* ---------------------------------------------------- */}
-      {/* BLOCK: Floating chat widget                            */}
-      {/* ---------------------------------------------------- */}
+      {activeModal && (
+        <KPIModal
+          kind={activeModal}
+          onClose={() => setActiveModal(null)}
+          datasetStatusCounts={datasetStatusCounts}
+          piiSeverityBreakdown={governanceSummary?.piiSeverityBreakdown ?? { HIGH: 0, MEDIUM: 0, LOW: 0 }}
+          riskLevelBreakdown={governanceSummary?.riskLevelBreakdown ?? { CRITICAL: 0, WARNING: 0, SAFE: 0 }}
+          avgRiskScore={governanceSummary?.avgRiskScore ?? 0}
+        />
+      )}
+
       <ChatWidget
         groqApiKey={GROQ_API_KEY}
         presetQuery={chatPresetQuery}
         presetTrigger={chatPresetTrigger}
+        onRemediationApplied={refreshGovernanceData}
       />
     </div>
   );
