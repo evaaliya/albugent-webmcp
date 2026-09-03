@@ -24,7 +24,7 @@ The split is: **the agent decides and explains; the engine computes and executes
 
 ## Architecture
 
-This tree reflects what's actually wired in and imported — it was audited against the real repository rather than reconstructed from memory, after an earlier draft of this file listed files that had since been deleted or were never actually used.
+This tree reflects what's actually wired in and imported 
 
 ```
 src/
@@ -65,7 +65,7 @@ public/
     nyc_taxi_pipeline.db
 ```
 
-Two folders that existed at earlier points in development were removed as dead weight once confirmed unused: an empty `src/data/` directory (the real data lives in `public/datasets/`, not under `src/`) and an empty `src/webmcp/schemas/` directory. `src/engine/GovernanceEngine.ts` — a leftover, empty scaffold file from before this repository's current architecture was settled — was also removed.
+
 
 ## Deterministic core vs. agent — the design rule
 
