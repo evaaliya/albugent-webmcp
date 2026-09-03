@@ -2,7 +2,7 @@
 
 🌐 **Live Production Application:** [https://albugent-webmcp-6mwn.vercel.app](https://albugent-webmcp-6mwn.vercel.app)
 
-**Deterministic data governance for a browser-native, human + agent workflow — built from the ground up for the WebMCP Challenge.**
+**Deterministic data governance for a browser-native, human + agent workflow — built for the WebMCP Challenge.**
 
 Albugent is a client-side data governance dashboard that discovers, profiles, and audits tables across three simulated enterprise domains (healthcare, fiction-retail, and an NYC taxi data pipeline), stored as SQLite files and loaded entirely in-browser via SQLite WASM. A person sees a live dashboard. An AI agent, through WebMCP tools registered directly on the page, can inspect the exact same computed data and — with explicit human approval — propose and apply real remediations, such as masking detected PII columns.
 
