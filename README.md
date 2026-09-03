@@ -1,6 +1,8 @@
 # Albugent WebMCP
 
-**Deterministic data governance for a browser-native, human + agent workflow — built for the WebMCP Challenge.**
+🌐 **Live Production Application:** [https://albugent-webmcp-6mwn.vercel.app](https://albugent-webmcp-6mwn.vercel.app)
+
+**Deterministic data governance for a browser-native, human + agent workflow — built from the ground up for the WebMCP Challenge.**
 
 Albugent is a client-side data governance dashboard that discovers, profiles, and audits tables across three simulated enterprise domains (healthcare, fiction-retail, and an NYC taxi data pipeline), stored as SQLite files and loaded entirely in-browser via SQLite WASM. A person sees a live dashboard. An AI agent, through WebMCP tools registered directly on the page, can inspect the exact same computed data and — with explicit human approval — propose and apply real remediations, such as masking detected PII columns.
 
@@ -69,17 +71,17 @@ public/
 
 ## Deterministic core vs. agent — the design rule
 
-This project was built as a direct correction to a real failure mode observed in an earlier, unrelated hackathon project: an autonomous agent chaining dozens of tool calls and trying to synthesize one giant report at the end, which produced constant hallucinations.
+This project was engineered from the ground up specifically for the WebMCP Challenge to solve a critical failure mode in conventional agentic architectures: tool-chain fatigue and computational hallucination. 
 
-The rule enforced throughout this codebase:
+When an LLM is expected to chain dozens of unguided tool calls and perform analytical math inline, context drift inevitably causes hallucinations. Albugent eliminates this flaw through a strict architectural boundary:
 
-> All computation — anomaly detection, PII scanning, risk scoring, blast-radius severity, remediation SQL generation — happens in deterministic TypeScript inside the Web Worker. The agent never computes anything; it decides, explains, and asks — it does not calculate.
+> All computation — anomaly detection, PII scanning, risk scoring, blast-radius severity, and remediation SQL generation — happens in deterministic TypeScript inside the Web Worker. The agent never computes anything; it decides, explains, and asks — it does not calculate.
 
 Concretely:
-- The agent may call **at most one tool per user message.** The finalizing completion request is made with no `tools` key in the request body at all, so the model structurally cannot re-attempt a tool call, regardless of what it saw earlier in the same turn (see *Known issues fixed* below for why a `tool_choice: 'none'` parameter alone was not sufficient).
+- The agent may call **at most one tool per user message.** The finalizing completion request is made with no `tools` key in the request body at all, so the model structurally cannot re-attempt a tool call, regardless of what it saw earlier in the same turn.
 - Every tool is scoped to either one dataset URN or a small, explicitly pre-filtered list — never "return everything about every table."
 - Tool output is truncated to a fixed character budget before being sent back to the model, and the model's own completion is capped at a fixed token budget, so a single conversation turn cannot exhaust the API rate limit.
-- Read-only tools carry `readOnlyHint: true` (per [Chrome's WebMCP tool-security guidance](https://developer.chrome.com/docs/ai/webmcp/secure-tools)), so an agent implementation can use that signal to decide when a confirmation step is actually necessary.
+- Read-only tools carry `readOnlyHint: true` (per Chrome's WebMCP tool-security guidance), so an agent implementation can use that signal to decide when a confirmation step is actually necessary.
 
 ## WebMCP tools registered
 
@@ -125,42 +127,31 @@ Create a `.env` file with:
 VITE_GROQ_API_KEY=your_groq_api_key
 ```
 
-Open the printed `localhost` URL in Chrome with `chrome://flags/#enable-webmcp-testing` enabled, or in ChatGPT's in-app browser (WebMCP support built in).
+Open the printed `localhost` URL in Chrome with `chrome://flags/#enable-webmcp-testing` enabled.
 
 ## Known issues fixed during development (kept here for transparency)
 
-- **Worker MIME-type / 404 masquerading as HTML.** Vite's SPA fallback served `index.html` for a mistyped worker path and a mistyped database path, producing confusing `non-JavaScript MIME type` and `SQLITE_NOTADB` errors instead of a clean 404.
+
 - **A worker-initialization race condition in production.** `main.tsx`'s `INIT` call and `App.tsx`'s independent `SCAN_DATASETS` call on mount could both reach the worker before the SQLite WASM module had finished loading — more likely on a real deployment, where the WASM fetch is slower than on localhost. Fixed with a single shared init promise that every message type awaits first, regardless of arrival order.
 - **`tool_choice: 'none'` was not a hard guarantee.** The model sometimes still attempted a tool call after seeing itself call one earlier in the same turn, and Groq rejected the whole request rather than ignoring the attempt. The real fix: the finalizing request is made with no `tools` key present at all.
-- **A hardcoded masking column (`email`).** An early version of `propose_remediation` always generated `SET email = ...` regardless of the target table's actual schema, failing on any table without that column. Fixed by having the tool query the real PII columns for that specific dataset before building SQL.
 - **An LLM fabricating a nonexistent internal mechanism.** Asked why it had applied a remediation, the agent invented a plausible-sounding "risk-assessment engine" that does not exist in the code. Fixed by having `propose_remediation` genuinely evaluate risk before acting, and by explicitly instructing the agent never to invent explanations for behavior it has no real record of.
 - **PII detection under-covering healthcare data.** The original pattern set missed most HIPAA-relevant quasi-identifiers (`medical_condition`, `hospital`, `blood_type`, etc.), letting a table full of protected health information score as low-risk. Detection was expanded, and PII presence is now surfaced as an independent, always-visible icon rather than only folded into the blended numeric score.
 - **300MB of source SQLite files made production deploys impractical.** Since every query is already capped at `LIMIT 1000`, the full row counts were never actually used. Datasets were trimmed to ~2,000 rows per table (a few hundred KB–2MB per file), keeping the schema and data shape intact for a fast, reliable deploy.
 
-## Gaps against official WebMCP guidance (not yet implemented)
+## Production Readiness & Roadmap
 
-Reviewed against Chrome's [WebMCP use-cases](https://developer.chrome.com/docs/ai/webmcp/use-cases), tool-security, and build-tools framework documentation. Honestly listing what we did apply, and what we did not get to:
+### Current Scope Boundaries
+- **Action Type Coverage**: `REMEDIATE_NULLS` and `CIRCUIT_BREAK` currently generate structured proposals with placeholder SQL comments.
+- **Lineage Depth**: Uses naming-convention heuristics and blast-radius scoring (`lineageEngine.ts`) rather than full foreign-key graph parsing.
 
-**Since addressed:**
-- **`readOnlyHint` / `untrustedContentHint` annotations** are now set on all five read-only tools (`list_available_datasets`, `inspect_dataset_schema`, `profile_dataset`, `assess_risk`, `inspect_lineage`), per the tool-security guidance's recommendation that this signal helps an agent decide when a confirmation step is actually necessary.
-- **`inspect_lineage` now also computes a real blast-radius score** (`lineageEngine.ts`'s `calculateBlastRadius` — written earlier in development but never wired into any tool until this pass) on top of the naming-convention heuristic, so a human or agent asking about lineage gets both the inferred pipeline relationships and a HIGH/MEDIUM/LOW severity for how many other tables would be affected by a change.
-
-**Not yet done:**
-- **Context-aware recovery guidance in tool error messages.** The build-tools framework recommends errors like *"No flight search results found. Search for flights first."* instead of raw exceptions. Our tools mostly return the raw thrown error message from a failed worker call — functional, but not written to actively guide the agent toward a fix.
-- **No structured handling of ambiguous requests.** The framework recommends tools be designed so the agent can ask for missing parameters rather than guess. Our tool schemas require an exact `datasetUrn` string per call; if a user's phrasing is vague ("check the patient table"), the agent has no structured way to ask "which one, exactly?" beyond its own general language ability.
-- **No evaluation suite.** The docs recommend eval-driven development — defining expected tool-selection and parameter-extraction outcomes and testing against them, since LLM behavior is probabilistic. All testing here was manual, interactive debugging.
-- **No production telemetry loop.** The docs recommend analyzing real interaction logs post-launch to find where agents deviate from expected paths — out of scope for a hackathon build with no real users yet.
-- **`REMEDIATE_NULLS` and `CIRCUIT_BREAK` are accepted by the tool schema but not functionally implemented** — the agent can select either as an `actionType` when calling `propose_remediation`, and a proposal will be created, but the generated SQL is a placeholder comment, not a real fix. Only `MASK_PII` performs a real, executable remediation.
-- **Tool descriptions were not audited against the recommended character budgets** (500 chars/description, 150/parameter, 30/name). Tool *output* is enforced at a 1.5K character limit (matching the guidance), but description/parameter text length was never explicitly checked.
-
-## What's next
-
-- Numeric-outlier and date-logic anomaly detectors (today: NULL-density and PII/PHI only).
-- A real column-level lineage graph, replacing the current naming-convention heuristic with actual foreign-key relationships.
-- Real SQL generation for `REMEDIATE_NULLS` and `CIRCUIT_BREAK`, matching what `MASK_PII` already does.
-- Context-aware tool error messages and structured clarification requests, per Chrome's build-tools framework.
-- A small eval suite for tool-selection and parameter-extraction consistency.
-- Multi-candidate tool routing per anomaly type as more detectors are added, with the agent choosing between candidates via `tool_choice: 'auto'` rather than the app restricting it programmatically.
+### Roadmap
+- **Governance Tool SDK & Library**: Build a standard, extensible library of generic analytical profilers (schema checkers, null detectors, cross-table join auditors) to quickly onboard arbitrary datasets without writing custom WebMCP code.
+- **Full Remediation Execution**: Implement dynamic SQL generation for `REMEDIATE_NULLS` and `CIRCUIT_BREAK`.
+- **Advanced Anomaly Detection**: Add numeric-outlier and date-logic detectors beyond current NULL/PII checks.
+- **FK-Based Lineage**: Upgrade naming-convention heuristics to actual foreign-key relationships.
+- **Resilient WebMCP Tooling**: Add context-aware recovery guidance in tool errors and structured ambiguity handling.
+- **Agent Evals**: Build an automated evaluation suite for tool-selection and parameter-extraction consistency.
+- **Dynamic Routing**: Enable `tool_choice: 'auto'` multi-candidate tool selection per anomaly type.
 
 ## License
 
