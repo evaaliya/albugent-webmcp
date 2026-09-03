@@ -2,29 +2,35 @@
 node_modules/
 .pnpm-store/
 
-# Build outputs
+# Build & Output
 dist/
 dist-ssr/
 *.tsbuildinfo
 
-# Environment & Local Overrides
+# Environment & Local Configuration
 .env
 .env.local
 .env.*.local
 *.local
 
 # Logs
+logs
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+lerna-debug.log*
 
-# IDE & System Files
+# IDE & Editors (VSCode & Cursor)
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
 .idea/
+.cursor/
+!.cursorrules
+
+# System & Temp Files
 .DS_Store
 *.suo
 *.ntvs*
@@ -38,12 +44,12 @@ pnpm-debug.log*
 htmlcov/
 __pycache__/
 
-# Database files & Exception for Vercel Demo
+# Database Files & Exception for Vercel Demo
 *.sqlite
 *.sqlite3
 *.db
 
-# 🛑 ИСКЛЮЧЕНИЕ: Демо-базы данных в public/datasets ОБЯЗАТЕЛЬНО должны закоммититься,
-# иначе Web Worker не сможет загрузить их после деплоя на Vercel.
+# 🛑 ИСКЛЮЧЕНИЕ: Демо-базы SQLite в public/datasets ОБЯЗАТЕЛЬНО должны попадать в Git,
+# иначе Vercel не сможет отдать их браузеру для работы SQLite WASM.
 !public/datasets/
 !public/datasets/*.db
