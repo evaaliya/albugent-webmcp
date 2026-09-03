@@ -224,8 +224,15 @@ self.onmessage = async (event: MessageEvent) => {
         rowMode: 'object',
         callback: (col: any) => columnNames.push(col.name)
       });
-
-      const piiFields = detectPII(columnNames);
+//selective mask checking-----------------------✓
+      const sampleRows: any[] = [];
+      db.exec({
+        sql: `SELECT * FROM "${meta.table}" LIMIT 100;`,
+        rowMode: 'object',
+        callback: (r: any) => sampleRows.push(r)
+      });
+//---------
+      const piiFields = detectPII(columnNames, sampleRows);
 
       self.postMessage({ id, success: true, data: { urn, piiFields } });
       return;
@@ -277,7 +284,7 @@ self.onmessage = async (event: MessageEvent) => {
           });
 
           const profile = analyzeAnomalies(meta.table, rows, cols);
-          const piiFields = detectPII(cols.map((c) => c.name));
+          const piiFields = detectPII(cols.map((c) => c.name), rows);//✔+rows
 
           totalPiiFields += piiFields.length;
           piiFields.forEach((p) => { piiSeverityBreakdown[p.severity]++; });

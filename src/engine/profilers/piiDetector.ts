@@ -5,13 +5,32 @@ export interface PIIField {
   piiType: 'SSN' | 'CARD' | 'EMAIL' | 'NAME' | 'DOB' | 'LOCATION' | 'MEDICAL' | 'FINANCIAL' | 'UNKNOWN';
   severity: 'HIGH' | 'MEDIUM' | 'LOW';
 }
+//function for status check
+function isColumnMasked(columnName: string, rows?: any[]): boolean {
+  if (!rows || rows.length === 0) return false;
+//checking all tables statuses
+  const values = rows
+    .map((r) => r[columnName])
+    .filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
 
-export function detectPII(columns: string[]): PIIField[] {
+  if (values.length === 0) return false;
+//if all not empty tables contain '***' or '[MASKED]' - table is masked!
+  return values.every((v) => {
+    const str = String(v).trim();
+    return str === '***' || str.startsWith('[MASKED]') || str.includes('***');
+  });
+}
+
+export function detectPII(columns: string[], rows?: any[]): PIIField[] {
   const piiFields: PIIField[] = [];
 
   for (const col of columns) {
+//if masked- pass!
+    if (isColumnMasked(col, rows)) {
+      continue; 
+    }
     const lower = col.toLowerCase();
-
+   
     if (lower.includes('ssn') || lower.includes('social') || lower.includes('passport') || lower.includes('mrn') || lower.includes('medical_record')) {
       piiFields.push({ columnName: col, piiType: 'SSN', severity: 'HIGH' });
     } else if (lower.includes('card') || lower.includes('credit') || lower.includes('account_number') || lower.includes('iban')) {
