@@ -7,6 +7,7 @@ import { detectPII, type PIIField } from '../engine/profilers/piiDetector';
 import { computeRiskScore } from '../engine/profilers/riskEvaluator';
 import { inferLineageNeighbors } from '../engine/profilers/lineageHeuristics';
 import { addProposal, getProposal, removeProposal, type RemediationProposal } from './proposalStore';
+import { calculateBlastRadius } from '../engine/profilers/lineageEngine';
 
 export type { RemediationProposal };
 
@@ -26,6 +27,7 @@ export function registerGovernanceTools(
     name: 'list_available_datasets',
     description: 'Returns a list of all DataHub dataset URNs available for audit.',
     inputSchema: { type: 'object', properties: {} },
+    annotations: { readOnlyHint: true, untrustedContentHint: false },
     execute: async () => {
       try {
         const datasets = await callWorker('SCAN_DATASETS');
@@ -49,6 +51,7 @@ export function registerGovernanceTools(
       },
       required: ['datasetUrn']
     },
+    annotations: { readOnlyHint: true, untrustedContentHint: false },
     execute: async (args: { datasetUrn: string }) => {
       try {
         const schema = await callWorker('GET_SCHEMA', { urn: args.datasetUrn });
@@ -70,6 +73,7 @@ export function registerGovernanceTools(
       properties: { datasetUrn: { type: 'string' } },
       required: ['datasetUrn']
     },
+    annotations: { readOnlyHint: true, untrustedContentHint: false },
     execute: async (args: { datasetUrn: string }) => {
       try {
         const report = await callWorker('GET_PROFILE_METRICS', { urn: args.datasetUrn });
@@ -91,6 +95,7 @@ export function registerGovernanceTools(
       properties: { datasetUrn: { type: 'string' } },
       required: ['datasetUrn']
     },
+    annotations: { readOnlyHint: true, untrustedContentHint: false },
     execute: async (args: { datasetUrn: string }) => {
       try {
         const profile = await callWorker('GET_PROFILE_METRICS', { urn: args.datasetUrn });
@@ -120,14 +125,21 @@ export function registerGovernanceTools(
   // ------------------------------------------------------------
   // TOOL 5: inspect_lineage
   // ------------------------------------------------------------
+    // ------------------------------------------------------------
+  // TOOL 5: inspect_lineage
+  // Naming-convention lineage (client-side heuristic) PLUS a real
+  // blast-radius severity score computed by lineageEngine.ts — this
+  // reuses code that already existed but was never wired in.
+  // ------------------------------------------------------------
   modelContext.registerTool({
     name: 'inspect_lineage',
-    description: 'Infers upstream/downstream table relationships for a dataset from its naming convention (raw -> staging -> mart pipeline pattern).',
+    description: 'Infers upstream/downstream table relationships for a dataset from its naming convention (raw -> staging -> mart pipeline pattern), and scores the blast radius of changing it.',
     inputSchema: {
       type: 'object',
       properties: { datasetUrn: { type: 'string' } },
       required: ['datasetUrn']
     },
+    annotations: { readOnlyHint: true, untrustedContentHint: false },
     execute: async (args: { datasetUrn: string }) => {
       try {
         const allDatasets = await callWorker('SCAN_DATASETS');
@@ -142,6 +154,16 @@ export function registerGovernanceTools(
 
         const lineage = inferLineageNeighbors(target.table, siblingTableNames);
 
+        // Build a naming-convention-derived dependency map across the whole
+        // domain: fkMap[table] = tables it depends on (its upstream).
+        // calculateBlastRadius then finds every table that depends on the
+        // target — i.e. what would be affected if the target changes.
+        const fkMap: Record<string, string[]> = {};
+        for (const t of siblingTableNames) {
+          fkMap[t] = inferLineageNeighbors(t, siblingTableNames).upstream;
+        }
+        const blastRadius = calculateBlastRadius(target.table, fkMap);
+
         return {
           content: [{
             type: 'text',
@@ -151,7 +173,9 @@ export function registerGovernanceTools(
               pipelineStage: lineage.stage,
               upstream: lineage.upstream,
               downstream: lineage.downstream,
-              note: 'Lineage inferred deterministically from table naming convention, not a live dependency graph.'
+              blastRadiusScore: blastRadius.blastRadiusScore,
+              dependentTables: blastRadius.dependentTables,
+              note: 'Lineage and blast radius inferred deterministically from table naming convention, not a live foreign-key dependency graph.'
             }, null, 2)
           }]
         };
